@@ -1,0 +1,30 @@
+{
+  "likes": {
+    "1562818610": {
+      "title": "The Final Say",
+      "artist": "Caskets",
+      "genre": "Rock"
+    },
+    "1562818596": {
+      "title": "Drowned in Emotion",
+      "artist": "Caskets",
+      "genre": "Rock"
+    },
+    "1562818301": {
+      "title": "Lost in Echoes",
+      "artist": "Caskets",
+      "genre": "Rock"
+    },
+    "1562818079": {
+      "title": "Glass Heart",
+      "artist": "Caskets",
+      "genre": "Rock"
+    }
+  },
+  "dislikes": [
+    "215606502"
+  ],
+  "skips": [
+    "1657240257"
+  ]
+}
