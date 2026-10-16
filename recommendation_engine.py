@@ -304,48 +304,57 @@ class TuneTrailRecommender:
         disliked_ids = self.feedback["dislikes"]
         skipped_ids = self.feedback["skips"]
 
-        positive_ids = list(dict.fromkeys(seed_ids + liked_ids))
+        seed_ids = list(dict.fromkeys(str(t).strip().lower() for t in seed_ids))
+        liked_ids = list(dict.fromkeys(str(t).strip().lower() for t in liked_ids))
+        disliked_ids = list(dict.fromkeys(str(t).strip().lower() for t in disliked_ids))
+        skipped_ids = list(dict.fromkeys(str(t).strip().lower() for t in skipped_ids))
 
-        if not positive_ids:
+        if not seed_ids and not liked_ids:
             raise ValueError(
                 "Choose at least one seed song or like a song first."
             )
 
-        positive_indices = [
-            self.get_index(t)
-            for t in positive_ids
+        seed_indices = [
+            self.get_index(t) for t in seed_ids
             if t in self.track_to_index
         ]
-
+        liked_indices = [
+            self.get_index(t) for t in liked_ids
+            if t in self.track_to_index
+        ]
         negative_indices = [
-            self.get_index(t)
-            for t in disliked_ids
+            self.get_index(t) for t in disliked_ids
             if t in self.track_to_index
         ]
 
-        if not positive_indices:
-            raise ValueError("No valid positive seed songs were found.")
+        if not seed_indices and not liked_indices:
+            raise ValueError(
+                "No valid seed or liked GTZAN tracks were found."
+            )
 
-        # Average similarity to the songs the user likes.
-        positive_scores = self.similarity_matrix[
-            :, positive_indices
-        ].mean(axis=1)
+        # Keep seed similarity and saved-like similarity separate.
+        seed_scores = (
+            self.similarity_matrix[:, seed_indices].mean(axis=1)
+            if seed_indices else np.zeros(len(self.catalog))
+        )
+        liked_scores = (
+            self.similarity_matrix[:, liked_indices].mean(axis=1)
+            if liked_indices else np.zeros(len(self.catalog))
+        )
 
-        # A disliked song should lower the ranking of similar candidates.
-        if negative_indices:
-            negative_scores = self.similarity_matrix[
-                :, negative_indices
-            ].mean(axis=1)
-        else:
-            negative_scores = np.zeros(len(self.catalog))
+        # A disliked song lowers the ranking of similar candidates.
+        negative_scores = (
+            self.similarity_matrix[:, negative_indices].mean(axis=1)
+            if negative_indices else np.zeros(len(self.catalog))
+        )
 
-        # Similarity and preference scores.
         scores = (
-            SEED_WEIGHT * positive_scores
-            + LIKED_WEIGHT * positive_scores
+            SEED_WEIGHT * seed_scores
+            + LIKED_WEIGHT * liked_scores
             - DISLIKED_WEIGHT * negative_scores
         )
 
+        positive_ids = list(dict.fromkeys(seed_ids + liked_ids))
         excluded_ids = set(
             positive_ids + disliked_ids + skipped_ids
         )

@@ -35,6 +35,7 @@ def empty_feedback():
     return {
         "likes": {},
         "dislikes": [],
+        "disliked_songs": {},
         "skips": [],
     }
 
@@ -49,7 +50,18 @@ def load_catalog_feedback():
 
         data.setdefault("likes", {})
         data.setdefault("dislikes", [])
+        data.setdefault("disliked_songs", {})
         data.setdefault("skips", [])
+
+        # Normalize older feedback files without losing saved feedback.
+        if not isinstance(data["likes"], dict):
+            data["likes"] = {}
+        if not isinstance(data["dislikes"], list):
+            data["dislikes"] = []
+        if not isinstance(data["disliked_songs"], dict):
+            data["disliked_songs"] = {}
+        if not isinstance(data["skips"], list):
+            data["skips"] = []
 
         return data
 
@@ -83,6 +95,7 @@ def record_feedback(song, action):
             item for item in feedback["dislikes"]
             if str(item) != song_id
         ]
+        feedback["disliked_songs"].pop(song_id, None)
         feedback["skips"] = [
             item for item in feedback["skips"]
             if str(item) != song_id
@@ -90,6 +103,13 @@ def record_feedback(song, action):
 
     elif action == "dislike":
         feedback["likes"].pop(song_id, None)
+        feedback["disliked_songs"][song_id] = {
+            "id": song_id,
+            "title": song.get("title", "Unknown title"),
+            "artist": song.get("artist", "Unknown artist"),
+            "album": song.get("album", "Unknown album"),
+            "genre": song.get("genre", "Unknown genre"),
+        }
 
         if song_id not in [str(x) for x in feedback["dislikes"]]:
             feedback["dislikes"].append(song_id)
@@ -117,6 +137,95 @@ def record_feedback(song, action):
         item for item in visible
         if str(item.get("id")) != song_id
     ]
+
+
+# ---------------------------------------------------------
+# Personalize real-catalog recommendations from user feedback
+# ---------------------------------------------------------
+
+def _normalise_text(value):
+    return str(value or "").strip().casefold()
+
+
+def personalize_catalog_results(results, feedback, diversity=0.75):
+    """
+    Re-rank catalog search results using saved likes/dislikes.
+
+    This uses catalog metadata (genre and artist), not extracted audio
+    features. It is a transparent metadata-based personalization layer.
+    """
+    if not results:
+        return []
+
+    likes = list(feedback.get("likes", {}).values())
+    disliked_songs = list(feedback.get("disliked_songs", {}).values())
+    disliked_ids = {str(value) for value in feedback.get("dislikes", [])}
+    skipped_ids = {str(value) for value in feedback.get("skips", [])}
+
+    # Ignore old feedback entries where metadata was not saved.
+    liked_genres = [_normalise_text(x.get("genre")) for x in likes]
+    liked_artists = [_normalise_text(x.get("artist")) for x in likes]
+    disliked_genres = [_normalise_text(x.get("genre")) for x in disliked_songs]
+    disliked_artists = [_normalise_text(x.get("artist")) for x in disliked_songs]
+
+    liked_genres = [x for x in liked_genres if x and x != "unknown genre"]
+    liked_artists = [x for x in liked_artists if x and x != "unknown artist"]
+    disliked_genres = [x for x in disliked_genres if x and x != "unknown genre"]
+    disliked_artists = [x for x in disliked_artists if x and x != "unknown artist"]
+
+    # Frequency-weight preferences so repeated likes influence the profile more.
+    from collections import Counter
+    liked_genre_counts = Counter(liked_genres)
+    liked_artist_counts = Counter(liked_artists)
+    disliked_genre_counts = Counter(disliked_genres)
+    disliked_artist_counts = Counter(disliked_artists)
+
+    ranked = []
+    chosen_artists = set()
+    remaining = []
+
+    for song in results:
+        song_id = str(song.get("id", ""))
+        if song_id in disliked_ids or song_id in skipped_ids:
+            continue
+
+        genre = _normalise_text(song.get("genre"))
+        artist = _normalise_text(song.get("artist"))
+        score = float(song.get("discovery_score", 0.0) or 0.0)
+
+        if genre:
+            score += 0.18 * liked_genre_counts.get(genre, 0)
+            score -= 0.22 * disliked_genre_counts.get(genre, 0)
+        if artist:
+            score += 0.12 * liked_artist_counts.get(artist, 0)
+            score -= 0.18 * disliked_artist_counts.get(artist, 0)
+
+        remaining.append((score, song, artist))
+
+    # Greedy re-ranking: preference score first, with a modest repeated-artist
+    # penalty controlled by the existing diversity slider.
+    while remaining:
+        best_position = max(
+            range(len(remaining)),
+            key=lambda i: remaining[i][0] - (
+                0.25 * max(0.0, min(1.0, diversity))
+                if remaining[i][2] and remaining[i][2] in chosen_artists
+                else 0.0
+            ),
+        )
+        base_score, song, artist = remaining.pop(best_position)
+        song = dict(song)
+        song["personalized_score"] = round(
+            base_score - (
+                0.25 * max(0.0, min(1.0, diversity))
+                if artist and artist in chosen_artists else 0.0
+            ), 4
+        )
+        ranked.append(song)
+        if artist:
+            chosen_artists.add(artist)
+
+    return ranked
 
 
 # ---------------------------------------------------------
@@ -225,6 +334,20 @@ for key, value in DEFAULTS.items():
 st.markdown(
     """
     <style>
+
+    div[data-testid="stVerticalBlock"] {
+        gap: 0.45rem;
+    }
+
+    div[data-testid="stAudio"] {
+        margin-top: 0;
+        margin-bottom: 0;
+    }
+
+    .song-card {
+        padding: 5px 0;
+        border-bottom: 1px solid rgba(190,150,255,0.18);
+    }
     .stApp {
         background: linear-gradient(135deg, #100c20 0%, #1b1230 100%);
         color: #f5f2ff;
@@ -308,6 +431,39 @@ with m2:
 
 with m3:
     st.metric("Current batch", len(st.session_state.catalog_results))
+
+
+# ---------------------------------------------------------
+# Feedback and recommendation evaluation dashboard
+# ---------------------------------------------------------
+
+with st.expander("📊 Feedback & evaluation dashboard"):
+    current_feedback = load_catalog_feedback()
+    liked_items = list(current_feedback.get("likes", {}).values())
+    disliked_items = list(current_feedback.get("disliked_songs", {}).values())
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Likes", len(current_feedback.get("likes", {})))
+    d2.metric("Dislikes", len(current_feedback.get("dislikes", [])))
+    d3.metric("Skips", len(current_feedback.get("skips", [])))
+    d4.metric(
+        "Like / dislike ratio",
+        f"{len(liked_items) / max(1, len(disliked_items)):.2f}",
+    )
+
+    genre_counts = pd.Series(
+        [str(song.get("genre", "Unknown")) for song in liked_items]
+    ).value_counts()
+    if not genre_counts.empty:
+        st.markdown("**Genres in your liked-song library**")
+        st.bar_chart(genre_counts.head(10))
+    else:
+        st.caption("Like a few songs to see your genre-preference profile.")
+
+    st.caption(
+        "These are feedback and preference indicators, not an offline model "
+        "accuracy score. Ground-truth relevance labels are not available yet."
+    )
 
 
 # ---------------------------------------------------------
@@ -569,8 +725,13 @@ if st.button("Find real songs for me", type="primary", use_container_width=True)
                     diversity=diversity_percent / 100.0,
                 )
 
-            # Never show previously disliked or skipped songs again.
+            # Re-rank using saved likes/dislikes, then exclude blocked IDs.
             feedback = load_catalog_feedback()
+            results = personalize_catalog_results(
+                results,
+                feedback,
+                diversity=diversity_percent / 100.0,
+            )
             blocked_ids = {
                 str(item) for item in (
                     feedback["dislikes"] + feedback["skips"]
@@ -626,7 +787,7 @@ if pool:
 
 if visible_songs:
     # Only this panel scrolls; the controls below remain outside it.
-    with st.container(height=620, border=True):
+    with st.container(height=520, border=True):
         for song in visible_songs:
             with st.container():
                 left, right = st.columns([1, 6], gap="small")                                      
@@ -651,8 +812,8 @@ if visible_songs:
                     st.caption(
                         f"Discovery term: "
                         f"{song.get('recommended_genre', 'N/A')} · "
-                        f"Diversity score: "
-                        f"{song.get('discovery_score', 0):.2f}"
+                        f"Personalized score: "
+                        f"{song.get('personalized_score', song.get('discovery_score', 0)):.2f}"
                     )
 
                     if song.get("preview"):
