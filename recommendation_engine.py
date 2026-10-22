@@ -1,15 +1,19 @@
 
 import json
 from pathlib import Path
+from typing import Dict, Any, List, Optional, Union
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.neighbors import NearestNeighbors
+
+from audio_processor import explain_match, EXPECTED_COLUMNS
 
 
 # ============================================================
-# TUNETRAIL - PHASE 1: MUSIC RECOMMENDATION ENGINE
+# TUNETRAIL / SOS: MUSIC RECOMMENDATION ENGINE
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -35,19 +39,15 @@ ARTIST_PENALTY = 0.25
 
 def get_track_id(filename):
     """Convert segment filenames into unique original-song IDs."""
-
     name = Path(str(filename)).stem.lower()
-
     # A 3-second segment may be named blues.00000.0.
     # Remove the final segment number to obtain blues.00000.
     name = __import__("re").sub(r"\.\d+$", "", name)
-
     return name
 
 
 def load_catalog():
     """Prefer full-track features; use 3-second features as fallback."""
-
     if not FILE_3_SEC.exists():
         raise FileNotFoundError(
             f"Dataset not found: {FILE_3_SEC}"
@@ -69,7 +69,6 @@ def load_catalog():
     ]
 
     agg3 = df3.groupby("track_id")[numeric3].mean()
-
     labels3 = df3.groupby("track_id")["label"].first()
     agg3["label"] = labels3
 
@@ -147,18 +146,7 @@ def load_catalog():
     scaler = StandardScaler()
     scaled_features = scaler.fit_transform(features)
 
-    print(f"Catalog loaded: {len(catalog)} unique tracks")
-    print(f"Audio features: {len(feature_columns)}")
-
-    if catalog["artist"].notna().any():
-        print("Artist metadata: available for some tracks")
-    else:
-        print(
-            "Artist metadata: unavailable in GTZAN; "
-            "artist-diversity penalty will activate when metadata is added."
-        )
-
-    return catalog, feature_columns, scaled_features
+    return catalog, feature_columns, scaled_features, scaler
 
 
 # ============================================================
@@ -184,7 +172,6 @@ def load_feedback():
         }
 
     except (json.JSONDecodeError, OSError):
-        print("Warning: feedback file could not be read. Starting fresh.")
         return {
             "likes": [],
             "dislikes": [],
@@ -199,7 +186,6 @@ def save_feedback(feedback):
 
 def record_feedback(track_id, action, feedback):
     """Save a like, dislike, or skip and remove conflicting feedback."""
-
     action = action.lower()
 
     if action not in {"like", "dislike", "skip"}:
@@ -221,11 +207,9 @@ def record_feedback(track_id, action, feedback):
     feedback[category].append(track_id)
     save_feedback(feedback)
 
-    print(f"Recorded {action}: {track_id}")
-
 
 # ============================================================
-# 3. RECOMMENDATION ENGINE
+# 3. RECOMMENDATION ENGINE WITH VECTOR INDEX & XAI EXPLANATIONS
 # ============================================================
 
 class TuneTrailRecommender:
@@ -234,7 +218,8 @@ class TuneTrailRecommender:
         (
             self.catalog,
             self.feature_columns,
-            self.features
+            self.features,
+            self.scaler
         ) = load_catalog()
 
         self.feedback = load_feedback()
@@ -246,17 +231,20 @@ class TuneTrailRecommender:
 
         self.track_ids = self.catalog["track_id"].tolist()
 
-        # Precompute all pairwise similarities.
-        self.similarity_matrix = cosine_similarity(self.features)
+        # Precompute pairwise similarities normalized to [0, 1].
+        raw_sim = cosine_similarity(self.features)
+        self.similarity_matrix = (raw_sim + 1.0) / 2.0
 
-        # Convert cosine similarity from [-1, 1] to [0, 1].
-        self.similarity_matrix = (
-            self.similarity_matrix + 1.0
-        ) / 2.0
+        # Vector Index for fast Approximate/Exact Nearest Neighbor queries
+        self.nn_index = NearestNeighbors(
+            n_neighbors=min(50, len(self.catalog)),
+            metric="cosine",
+            algorithm="auto"
+        )
+        self.nn_index.fit(self.features)
 
     def find_tracks(self, query, limit=15):
         """Search by track ID or genre."""
-
         query = query.lower().strip()
 
         matches = self.catalog[
@@ -283,6 +271,141 @@ class TuneTrailRecommender:
 
         return self.track_to_index[track_id]
 
+    def get_track_raw_features(self, track_id: str) -> Dict[str, float]:
+        """Retrieve raw numerical features for a catalog track."""
+        idx = self.get_index(track_id)
+        row = self.catalog.iloc[idx]
+        return {col: float(row[col]) for col in self.feature_columns if col in row}
+
+    def recommend_from_vector(
+        self,
+        query_vector: Union[Dict[str, float], pd.DataFrame, np.ndarray],
+        top_n: int = TOP_N,
+        diversity: float = 0.75,
+        exclude_ids: Optional[set] = None
+    ) -> pd.DataFrame:
+        """
+        Recommend songs directly from an extracted audio feature vector
+        (e.g., from an uploaded audio file or recorded microphone sample).
+        """
+        # Convert dictionary or array into standard ordered DataFrame
+        if isinstance(query_vector, dict):
+            raw_dict = query_vector
+            df_q = pd.DataFrame([query_vector])
+        elif isinstance(query_vector, pd.DataFrame):
+            df_q = query_vector
+            raw_dict = df_q.iloc[0].to_dict()
+        elif isinstance(query_vector, np.ndarray):
+            df_q = pd.DataFrame(query_vector.reshape(1, -1), columns=self.feature_columns)
+            raw_dict = df_q.iloc[0].to_dict()
+        else:
+            raise ValueError(f"Unsupported query vector format: {type(query_vector)}")
+
+        # Ensure all required columns are present and ordered
+        missing = [c for c in self.feature_columns if c not in df_q.columns]
+        for col in missing:
+            df_q[col] = 0.0
+
+        clean_df = df_q[self.feature_columns].fillna(0.0)
+
+        # Scale using the catalog's fitted scaler
+        scaled_q = self.scaler.transform(clean_df)
+
+        # Compute cosine similarity across all tracks
+        raw_sim = cosine_similarity(scaled_q, self.features)[0]
+        # Normalize to [0, 1]
+        seed_scores = (raw_sim + 1.0) / 2.0
+
+        liked_ids = self.feedback.get("likes", [])
+        disliked_ids = self.feedback.get("dislikes", [])
+        skipped_ids = self.feedback.get("skips", [])
+
+        liked_indices = [
+            self.track_to_index[t] for t in liked_ids
+            if t in self.track_to_index
+        ]
+        negative_indices = [
+            self.track_to_index[t] for t in disliked_ids
+            if t in self.track_to_index
+        ]
+
+        liked_scores = (
+            self.similarity_matrix[:, liked_indices].mean(axis=1)
+            if liked_indices else np.zeros(len(self.catalog))
+        )
+        negative_scores = (
+            self.similarity_matrix[:, negative_indices].mean(axis=1)
+            if negative_indices else np.zeros(len(self.catalog))
+        )
+
+        scores = (
+            SEED_WEIGHT * seed_scores
+            + LIKED_WEIGHT * liked_scores
+            - DISLIKED_WEIGHT * negative_scores
+        )
+
+        excluded = set(disliked_ids + skipped_ids)
+        if exclude_ids:
+            excluded.update(exclude_ids)
+
+        candidates = [
+            i for i, track_id in enumerate(self.track_ids)
+            if track_id not in excluded
+        ]
+
+        results = []
+        chosen_artists = set()
+        has_artist_metadata = self.catalog["artist"].notna().any()
+
+        while candidates and len(results) < top_n:
+            best_idx = None
+            best_score = -float("inf")
+
+            for idx in candidates:
+                score = float(scores[idx])
+                artist = self.catalog.iloc[idx]["artist"]
+
+                if (
+                    has_artist_metadata
+                    and pd.notna(artist)
+                    and artist in chosen_artists
+                ):
+                    score -= ARTIST_PENALTY * diversity
+
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+
+            if best_idx is None:
+                break
+
+            row = self.catalog.iloc[best_idx]
+            cand_features = {
+                col: float(row[col]) for col in self.feature_columns if col in row
+            }
+
+            # Generate Explainable AI breakdown
+            explanation = explain_match(raw_dict, cand_features)
+
+            results.append({
+                "track_id": row["track_id"],
+                "genre": row["label"],
+                "artist": row["artist"] if pd.notna(row["artist"]) else "Unknown",
+                "score": round(best_score, 4),
+                "tempo_match": explanation["tempo_match_pct"],
+                "energy_match": explanation["energy_match_pct"],
+                "brightness_match": explanation["brightness_match_pct"],
+                "badges": explanation["badges"],
+                "bpm": explanation["tempo"],
+            })
+
+            if pd.notna(row["artist"]):
+                chosen_artists.add(row["artist"])
+
+            candidates.remove(best_idx)
+
+        return pd.DataFrame(results)
+
     def recommend(
         self,
         seed_ids=None,
@@ -290,16 +413,11 @@ class TuneTrailRecommender:
         diversity=0.75
     ):
         """
-        Rank songs using seed similarity, feedback, and artist diversity.
-
-        diversity:
-            0.0 = no artist repetition penalty
-            1.0 = strong artist repetition penalty
+        Rank songs using seed similarity, feedback, and artist diversity,
+        with explainable audio feature breakdown.
         """
-
         seed_ids = seed_ids or []
 
-        # The user's saved feedback becomes part of their taste profile.
         liked_ids = self.feedback["likes"]
         disliked_ids = self.feedback["dislikes"]
         skipped_ids = self.feedback["skips"]
@@ -332,7 +450,6 @@ class TuneTrailRecommender:
                 "No valid seed or liked GTZAN tracks were found."
             )
 
-        # Keep seed similarity and saved-like similarity separate.
         seed_scores = (
             self.similarity_matrix[:, seed_indices].mean(axis=1)
             if seed_indices else np.zeros(len(self.catalog))
@@ -342,7 +459,6 @@ class TuneTrailRecommender:
             if liked_indices else np.zeros(len(self.catalog))
         )
 
-        # A disliked song lowers the ranking of similar candidates.
         negative_scores = (
             self.similarity_matrix[:, negative_indices].mean(axis=1)
             if negative_indices else np.zeros(len(self.catalog))
@@ -364,11 +480,13 @@ class TuneTrailRecommender:
             if track_id not in excluded_ids
         ]
 
-        # Greedy ranking applies the diversity penalty after each choice.
-        # This works only when actual artist metadata is available.
+        # For XAI explanations against seed tracks
+        primary_seed_features = None
+        if seed_indices:
+            primary_seed_features = self.get_track_raw_features(self.track_ids[seed_indices[0]])
+
         results = []
         chosen_artists = set()
-
         has_artist_metadata = self.catalog["artist"].notna().any()
 
         while candidates and len(results) < top_n:
@@ -377,7 +495,6 @@ class TuneTrailRecommender:
 
             for idx in candidates:
                 score = float(scores[idx])
-
                 artist = self.catalog.iloc[idx]["artist"]
 
                 if (
@@ -395,17 +512,29 @@ class TuneTrailRecommender:
                 break
 
             row = self.catalog.iloc[best_idx]
-            artist = row["artist"]
+            cand_features = {
+                col: float(row[col]) for col in self.feature_columns if col in row
+            }
+
+            if primary_seed_features:
+                explanation = explain_match(primary_seed_features, cand_features)
+                badges = explanation["badges"]
+                tempo_val = explanation["tempo"]
+            else:
+                badges = []
+                tempo_val = cand_features.get("tempo", 120.0)
 
             results.append({
                 "track_id": row["track_id"],
                 "genre": row["label"],
-                "artist": artist if pd.notna(artist) else "Unknown",
-                "score": round(best_score, 4)
+                "artist": row["artist"] if pd.notna(row["artist"]) else "Unknown",
+                "score": round(best_score, 4),
+                "badges": badges,
+                "bpm": round(tempo_val, 1),
             })
 
-            if pd.notna(artist):
-                chosen_artists.add(artist)
+            if pd.notna(row["artist"]):
+                chosen_artists.add(row["artist"])
 
             candidates.remove(best_idx)
 
@@ -471,9 +600,7 @@ Commands:
                     print(results.to_string(index=False))
 
             elif action == "recommend":
-                # Optional song IDs may be separated by spaces.
                 seeds = args
-
                 results = recommender.recommend(
                     seed_ids=seeds,
                     top_n=TOP_N,
@@ -482,12 +609,6 @@ Commands:
 
                 print("\nRecommended songs:")
                 print(results.to_string(index=False))
-
-                if not recommender.catalog["artist"].notna().any():
-                    print(
-                        "\nNote: artist diversity is awaiting artist "
-                        "metadata. GTZAN does not identify its artists."
-                    )
 
             elif action in {"like", "dislike", "skip"}:
                 if len(args) != 1:

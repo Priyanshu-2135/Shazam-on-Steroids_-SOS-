@@ -1,4 +1,5 @@
 
+import urllib.parse
 import requests
 import streamlit as st
 
@@ -7,38 +8,45 @@ ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def search_music(query, limit=50, country="IN"):
-    """Search Apple's public iTunes catalog for real songs."""
+    """
+    Search Apple's public iTunes catalog for real songs with country fallback
+    and streaming search links.
+    """
     query = str(query).strip()
 
     if not query:
         return []
 
-    params = {
-        "term": query,
-        "media": "music",
-        "entity": "song",
-        "limit": min(max(int(limit), 1), 50),
-        "country": country,
-    }
+    def _query_itunes(target_country):
+        params = {
+            "term": query,
+            "media": "music",
+            "entity": "song",
+            "limit": min(max(int(limit), 1), 50),
+            "country": target_country,
+        }
+        resp = requests.get(ITUNES_SEARCH_URL, params=params, timeout=12)
+        resp.raise_for_status()
+        return resp.json().get("results", [])
 
     try:
-        response = requests.get(
-            ITUNES_SEARCH_URL,
-            params=params,
-            timeout=15,
-        )
-        response.raise_for_status()
-        payload = response.json()
-
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            "Could not reach the music catalog. "
-            "Check your internet connection and try again."
-        ) from exc
+        raw_results = _query_itunes(country)
+        # Fallback to US if regional results are empty
+        if not raw_results and country != "US":
+            raw_results = _query_itunes("US")
+    except requests.RequestException:
+        try:
+            # One more retry with US
+            raw_results = _query_itunes("US")
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                "Could not reach the music catalog. "
+                "Check your internet connection and try again."
+            ) from exc
 
     songs = []
 
-    for item in payload.get("results", []):
+    for item in raw_results:
         if item.get("kind") != "song":
             continue
 
@@ -49,6 +57,10 @@ def search_music(query, limit=50, country="IN"):
         if not title or not artist or not track_id:
             continue
 
+        query_encoded = urllib.parse.quote_plus(f"{artist} {title}")
+        youtube_url = f"https://www.youtube.com/results?search_query={query_encoded}"
+        spotify_search_url = f"https://open.spotify.com/search/{query_encoded}"
+
         songs.append({
             "id": str(track_id),
             "title": title,
@@ -58,6 +70,8 @@ def search_music(query, limit=50, country="IN"):
             "artwork": item.get("artworkUrl100", ""),
             "preview": item.get("previewUrl", ""),
             "store_url": item.get("trackViewUrl", ""),
+            "youtube_url": youtube_url,
+            "spotify_url": spotify_search_url,
         })
 
     return songs
@@ -68,7 +82,6 @@ def search_recommendations(genres, limit_per_genre=50, diversity=0.75):
     Build a pool of real songs using genre/search terms.
 
     The diversity score favours artists that have appeared less often.
-    This is genre-guided discovery, not direct audio-feature similarity.
     """
     results = []
     seen_track_ids = set()
@@ -94,7 +107,6 @@ def search_recommendations(genres, limit_per_genre=50, diversity=0.75):
         try:
             songs = search_music(term, limit=limit_per_genre)
         except RuntimeError:
-            # One failed search should not prevent other genres from loading.
             continue
 
         for song in songs:

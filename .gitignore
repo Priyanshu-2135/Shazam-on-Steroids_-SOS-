@@ -1,0 +1,21 @@
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Python cache & tokens
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.cache
+.cache-*
+
+# Mac OS
+.DS_Store
+
+# Temporary outputs
+temp_*
+*.tmp

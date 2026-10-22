@@ -3,28 +3,42 @@
     "1562818610": {
       "title": "The Final Say",
       "artist": "Caskets",
-      "genre": "Rock"
+      "genre": "Rock",
+      "id": "1562818610"
     },
     "1562818596": {
       "title": "Drowned in Emotion",
       "artist": "Caskets",
-      "genre": "Rock"
+      "genre": "Rock",
+      "id": "1562818596"
     },
     "1562818301": {
       "title": "Lost in Echoes",
       "artist": "Caskets",
-      "genre": "Rock"
+      "genre": "Rock",
+      "id": "1562818301"
     },
     "1562818079": {
       "title": "Glass Heart",
       "artist": "Caskets",
-      "genre": "Rock"
+      "genre": "Rock",
+      "id": "1562818079"
     }
   },
   "dislikes": [
-    "215606502"
+    "215606502",
+    "6781076397"
   ],
   "skips": [
     "1657240257"
-  ]
+  ],
+  "disliked_songs": {
+    "6781076397": {
+      "id": "6781076397",
+      "title": "Another One Bites The Dust",
+      "artist": "Queen",
+      "album": "The Game (Deluxe Edition)",
+      "genre": "Rock"
+    }
+  }
 }
