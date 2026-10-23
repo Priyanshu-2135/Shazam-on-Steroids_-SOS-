@@ -19,3 +19,14 @@ __pycache__/
 # Temporary outputs
 temp_*
 *.tmp
+
+# Academic Reports and Presentations (Never push to repository)
+*.pptx
+*.ppt
+*.pdf
+*PROJECT_REPORT*
+*project_report*
+*Presentation*
+*presentation*
+*report*
+*Report*
