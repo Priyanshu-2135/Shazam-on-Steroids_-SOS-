@@ -1,0 +1,65 @@
+SOS Spotify Integration Setup
+=============================
+
+What it adds
+------------
+- Connects your Spotify account through OAuth.
+- Creates a private or public Spotify playlist from either your SOS liked songs
+  or the current SOS recommendation pool.
+- Searches Spotify for each song using title and artist, deduplicates matches,
+  and reports tracks that could not be matched.
+
+1. Create a Spotify Developer app
+---------------------------------
+Open https://developer.spotify.com/dashboard and create an app. Copy its Client ID
+and Client Secret. Do not share either credential in chat or commit them to Git.
+
+2. Configure the redirect URI
+-----------------------------
+In the app settings, add this exact Redirect URI:
+
+    http://127.0.0.1:8501
+
+Save the settings. The redirect URI must exactly match the value in .env.
+
+3. Add local credentials
+------------------------
+In your SOS project folder, create a file named .env containing:
+
+    SPOTIFY_CLIENT_ID=your_client_id_here
+    SPOTIFY_CLIENT_SECRET=your_client_secret_here
+    SPOTIFY_REDIRECT_URI=http://127.0.0.1:8501
+
+Replace the first two values with your own credentials. Keep .env private.
+
+4. Install the dependencies
+---------------------------
+Activate your existing virtual environment, then run:
+
+    python -m pip install python-dotenv requests
+
+5. Launch the app
+-----------------
+    python -m streamlit run app.py
+
+Open http://127.0.0.1:8501. In the Spotify integration section, click Connect
+Spotify account and approve the requested playlist permissions. Spotify should
+redirect back to SOS. Choose My Liked Songs or Current SOS recommendations, name
+the playlist, choose private/public, and click Create Spotify playlist.
+
+Security and troubleshooting
+----------------------------
+- Never commit .env or .spotify_token.json. Add both to .gitignore.
+- This integration only requests playlist-modify-private and
+  playlist-modify-public scopes. Spotify authorization is required to create
+  playlists for your account.
+- If Spotify reports a redirect mismatch, make sure the URI is exactly
+  http://127.0.0.1:8501 in both the developer dashboard and .env.
+- Keep Streamlit running on port 8501 while connecting. If you change the port,
+  update the redirect URI in both places.
+- If the app is in Spotify Development Mode, the Spotify account used to test it
+  may need to be added as an allowed/test user in the developer dashboard.
+- The integration searches Spotify using track title and artist. Catalog metadata
+  can be imperfect, so review the matched tracks before relying on a playlist.
+- Spotify may change API access requirements; consult the official documentation:
+  https://developer.spotify.com/documentation/web-api

@@ -34,14 +34,16 @@ ARTIST_PENALTY = 0.25
 # ============================================================
 
 def get_track_id(filename):
-    """Convert segment filenames into unique original-song IDs."""
+    """Return a stable song ID while collapsing only 3-second segment suffixes.
 
+    GTZAN 30-second files look like ``blues.00000.wav`` and must keep the
+    ``blues.00000`` ID. Three-second segment files look like
+    ``blues.00000.0.wav`` and should collapse to ``blues.00000``.
+    """
     name = Path(str(filename)).stem.lower()
-
-    # A 3-second segment may be named blues.00000.0.
-    # Remove the final segment number to obtain blues.00000.
-    name = __import__("re").sub(r"\.\d+$", "", name)
-
+    parts = name.split(".")
+    if len(parts) >= 3 and parts[-1].isdigit():
+        name = ".".join(parts[:-1])
     return name
 
 

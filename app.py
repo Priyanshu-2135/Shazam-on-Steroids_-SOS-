@@ -1,5 +1,6 @@
 
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -7,6 +8,11 @@ import streamlit as st
 
 from recommendation_engine import TuneTrailRecommender
 from music_catalog import search_music, search_recommendations
+from audio_matcher import rank_songs_by_audio
+from spotify_integration import (
+    spotify_configured, get_authorize_url, finish_authorization,
+    get_spotify_token, spotify_search_track, create_spotify_playlist,
+)
 
 
 # ---------------------------------------------------------
@@ -247,9 +253,16 @@ def load_gtzan_tracks():
     # The 3-second file has multiple segments for each original track.
     df = df.drop_duplicates(subset=["filename"]).copy()
 
-    df["track_id"] = df["filename"].astype(str).apply(
-        lambda name: Path(name).stem
-    )
+    def stable_track_id(filename):
+        stem = Path(str(filename)).stem.lower()
+        parts = stem.split(".")
+        # Only remove the final segment number from 3-second filenames such as
+        # blues.00000.0; preserve 30-second IDs such as blues.00000.
+        if len(parts) >= 3 and parts[-1].isdigit():
+            stem = ".".join(parts[:-1])
+        return stem
+
+    df["track_id"] = df["filename"].astype(str).apply(stable_track_id)
 
     return df.reset_index(drop=True)
 
@@ -320,6 +333,7 @@ DEFAULTS = {
     "catalog_message": "",
     "catalog_search_results": [],
     "seed_tracks": [],
+    "audio_match_stats": {},
 }
 
 for key, value in DEFAULTS.items():
@@ -400,6 +414,12 @@ with st.sidebar:
         max_value=100,
         value=75,
         help="Higher values penalize artists already represented in a batch.",
+    )
+
+    audio_matching_enabled = st.checkbox(
+        "Rank by audio similarity",
+        value=True,
+        help="Analyze short catalog previews and compare tempo, energy, spectral features, chroma, and MFCCs against selected GTZAN tracks. Some previews may not be decodable.",
     )
 
     st.divider()
@@ -743,6 +763,34 @@ if st.button("Find real songs for me", type="primary", use_container_width=True)
                 if str(song.get("id")) not in blocked_ids
             ]
 
+            audio_stats = {"scored": 0, "failed": 0, "skipped": len(results)}
+            if audio_matching_enabled and seed_ids and results:
+                try:
+                    recommender = load_recommender()
+                    progress = st.progress(0.0, text="Analyzing real-song audio previews...")
+
+                    def update_audio_progress(fraction, current, total):
+                        progress.progress(
+                            fraction,
+                            text=f"Analyzing audio preview {current}/{total}...",
+                        )
+
+                    results, audio_stats = rank_songs_by_audio(
+                        results,
+                        seed_ids,
+                        recommender,
+                        max_songs=30,
+                        progress_callback=update_audio_progress,
+                    )
+                    progress.empty()
+                except Exception as audio_exc:
+                    st.warning(
+                        "Audio matching was skipped; genre and feedback-based recommendations remain available. "
+                        f"Details: {audio_exc}"
+                    )
+
+            st.session_state.audio_match_stats = audio_stats
+
             # Keep the whole pool; display only the first batch.
             st.session_state.catalog_pool = results
             st.session_state.catalog_offset = 0
@@ -815,6 +863,11 @@ if visible_songs:
                         f"Personalized score: "
                         f"{song.get('personalized_score', song.get('discovery_score', 0)):.2f}"
                     )
+                    if song.get("audio_similarity") is not None:
+                        st.caption(
+                            f"🎚️ Audio similarity to your GTZAN seeds: "
+                            f"{song['audio_similarity']:.1f}/100"
+                        )
 
                     if song.get("preview"):
                         st.audio(
@@ -884,6 +937,116 @@ elif st.session_state.catalog_message:
     )
 
 # ---------------------------------------------------------
+# Spotify integration
+# ---------------------------------------------------------
+
+st.divider()
+st.header("🟢 Spotify integration")
+st.caption(
+    "Connect your Spotify account to create a Spotify playlist from your "
+    "liked songs or current SOS recommendations. SOS matches catalog songs "
+    "to Spotify tracks by title and artist; unmatched songs are skipped."
+)
+
+# OAuth callback: Spotify redirects back to the Streamlit localhost URL.
+try:
+    callback_code = st.query_params.get("code")
+    callback_state = st.query_params.get("state")
+    if callback_code:
+        if finish_authorization(callback_code, callback_state):
+            st.query_params.clear()
+            st.success("Spotify connected successfully. You can create a playlist below.")
+            st.rerun()
+        else:
+            st.error("Spotify authorization could not be completed. Check the redirect URI and try again.")
+except Exception as spotify_auth_error:
+    st.error(f"Spotify authorization error: {spotify_auth_error}")
+
+if not spotify_configured():
+    st.warning(
+        "Spotify is not configured yet. Create a Spotify Developer app, "
+        "then add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to a local .env file. "
+        "Follow the included SOS_SPOTIFY_SETUP.txt guide."
+    )
+else:
+    token = get_spotify_token()
+    if not token:
+        auth_url = get_authorize_url()
+        st.markdown("1. Click the authorization link and approve SOS in Spotify.")
+        st.link_button("Connect Spotify account", auth_url, use_container_width=True)
+        st.caption(
+            "After approving, Spotify should redirect back to this local app. "
+            "If it does not, verify that the redirect URI in your Spotify app is "
+            "exactly the one shown in SOS_SPOTIFY_SETUP.txt."
+        )
+    else:
+        st.success("Spotify account connected.")
+        playlist_source = st.radio(
+            "Playlist source",
+            ["My Liked Songs", "Current SOS recommendations"],
+            horizontal=True,
+            key="spotify_playlist_source",
+        )
+        if playlist_source == "My Liked Songs":
+            spotify_source_songs = list(load_catalog_feedback()["likes"].values())
+        else:
+            spotify_source_songs = list(st.session_state.get("catalog_pool", []))
+
+        playlist_name = st.text_input(
+            "Playlist name", value="SOS Discoveries", key="spotify_playlist_name"
+        )
+        playlist_private = st.checkbox("Create as a private playlist", value=True)
+        st.caption(f"{len(spotify_source_songs)} source song(s) available before Spotify matching.")
+
+        if st.button("Create Spotify playlist", type="primary", use_container_width=True):
+            if not playlist_name.strip():
+                st.warning("Enter a playlist name.")
+            elif not spotify_source_songs:
+                st.warning("There are no songs in this source yet. Like songs or generate recommendations first.")
+            else:
+                with st.spinner("Matching songs on Spotify and creating your playlist..."):
+                    matched_uris = []
+                    matched_titles = []
+                    unmatched_titles = []
+                    seen_uris = set()
+                    for source_song in spotify_source_songs:
+                        title = str(source_song.get("title", "")).strip()
+                        artist = str(source_song.get("artist", "")).strip()
+                        if not title or title.lower() == "unknown title":
+                            continue
+                        try:
+                            match = spotify_search_track(title, artist, token)
+                        except Exception:
+                            match = None
+                        if match and match.get("uri") and match["uri"] not in seen_uris:
+                            seen_uris.add(match["uri"])
+                            matched_uris.append(match["uri"])
+                            matched_titles.append(f"{match.get('name', title)} — {match.get('artist', artist)}")
+                        else:
+                            unmatched_titles.append(f"{title} — {artist}")
+
+                    if not matched_uris:
+                        st.error("No songs could be matched to Spotify. Try a different source or check song titles.")
+                    else:
+                        try:
+                            playlist = create_spotify_playlist(
+                                playlist_name.strip(),
+                                matched_uris,
+                                token,
+                                public=not playlist_private,
+                            )
+                            st.success(f"Created playlist with {len(matched_uris)} matched track(s).")
+                            if playlist.get("url"):
+                                st.markdown(f"[Open your playlist in Spotify]({playlist['url']})")
+                            with st.expander(f"Matched tracks ({len(matched_titles)})"):
+                                st.write("\n".join(f"• {name}" for name in matched_titles))
+                            if unmatched_titles:
+                                with st.expander(f"Could not match ({len(unmatched_titles)})"):
+                                    st.write("\n".join(f"• {name}" for name in unmatched_titles))
+                        except Exception as playlist_error:
+                            st.error(f"Spotify could not create the playlist: {playlist_error}")
+
+# ---------------------------------------------------------
 # Explanation
 # ---------------------------------------------------------
 
@@ -897,9 +1060,14 @@ with st.expander("How SOS recommendations work"):
         3. Artist diversity helps reduce repeated artists in the pool.
         4. Likes are saved locally and their genres influence future searches.
         5. Disliked and skipped catalog songs are excluded from future pools.
+        6. When enabled and GTZAN seeds are selected, SOS analyzes up to 30 short
+           catalog previews using tempo, RMS energy, chroma, spectral features,
+           zero-crossing rate, and MFCCs, then ranks decodable previews against
+           the selected GTZAN audio-feature profile.
 
-        Important: real catalog songs are currently found using genre-guided
-        searches. Their audio is not yet extracted and compared directly
-        against the GTZAN audio features.
+        Important: candidate discovery still starts with genre-guided catalog searches.
+        Audio similarity re-ranks only the first 30 candidates in the pool. It does
+        not provide full-track access, and preview URLs/codecs may prevent some songs
+        from receiving a score.
         """
     )
